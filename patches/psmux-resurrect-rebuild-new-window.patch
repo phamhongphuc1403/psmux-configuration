@@ -1,0 +1,60 @@
+diff --git a/scripts/restore.ps1 b/scripts/restore.ps1
+index b58531f..92b870c 100644
+--- a/scripts/restore.ps1
++++ b/scripts/restore.ps1
+@@ -143,6 +143,13 @@ try {
+     # kept and only the saved windows it is missing (by window index, the way
+     # tmux-resurrect's window_exists works) are added to it. When 'on', a
+     # session with the same saved name is killed and recreated from the save.
++    # [local patch] Command to type into every restored pane (see Restore-WindowPanes).
++    $paneHook = ''
++    try {
++        $hookOpt = (& $PSMUX show-options -gv '@resurrect-pane-hook' 2>&1 | Out-String).Trim()
++        if ($LASTEXITCODE -eq 0 -and $hookOpt -notmatch 'unknown option|error|no server|not found|refused') { $paneHook = $hookOpt }
++    } catch {}
++
+     $overwriteExisting = $false
+     try {
+         $overwriteOpt = (& $PSMUX show-options -gv '@resurrect-overwrite' 2>&1 | Out-String).Trim()
+@@ -226,6 +233,10 @@ try {
+                     -PluginDir $PLUGIN_DIR
+                 & $PSMUX send-keys -t $paneId $sendCmd Enter 2>&1 | Out-Null
+                 Start-Sleep -Milliseconds 200
++            } elseif ($paneHook) {
++                # [local patch] @resurrect-pane-hook: typed into every restored pane,
++                # whatever command was saved for it, so the pane can reopen its own state.
++                & $PSMUX send-keys -t $paneId $paneHook Enter 2>&1 | Out-Null
+             }
+         }
+         if ($activePaneId) {
+@@ -273,8 +284,30 @@ try {
+                         if ($Matches[2] -eq '1') { $activeBefore = [int]$Matches[1] }
+                     }
+                 }
++                # [local patch] A session created moments ago (by `psmux new -s main` or the
++                # login task, which is what fired this restore) still has an empty first
++                # window at a saved index. Leaving it alone loses that window's splits and
++                # programs, so rebuild such windows in place from their existing pane.
++                # (No check on what the pane runs: psmux reports its deepest child, which
++                # is whatever command happens to be querying it.)
++                $pristine = @{}
++                $createdRaw = (& $PSMUX display-message -p -t $sessionName '#{session_created}' 2>&1 | Out-String).Trim()
++                if ($createdRaw -match '^\d+$' -and ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$createdRaw) -lt 120) {
++                    foreach ($line in @(& $PSMUX list-panes -s -t $sessionName -F '#{window_index}|#{window_panes}|#{pane_id}' 2>&1)) {
++                        if ("$line" -match '^\s*(\d+)\|1\|(%\d+)\s*$') { $pristine[[int]$Matches[1]] = $Matches[2] }
++                    }
++                }
+                 $added = 0
+                 foreach ($win in @($session.windows)) {
++                    if ($pristine.ContainsKey([int]$win.index)) {
++                        $paneId = $pristine[[int]$win.index]
++                        # Its shell already started; the pane-resume profile hook moves it to the
++                        # saved folder (sending keys here could land in a program it resumed).
++                        if ($win.name) { & $PSMUX rename-window -t "${sessionName}:$($win.index)" $win.name 2>&1 | Out-Null }
++                        $null = Restore-WindowPanes -win $win -initialPaneId $paneId -WindowTarget "${sessionName}:$($win.index)"
++                        $added++
++                        continue
++                    }
+                     if ($liveIndexes.ContainsKey([int]$win.index)) { continue }
+                     $winDir = if ($win.panes -and $win.panes[0].directory) { $win.panes[0].directory } else { $env:USERPROFILE }
+                     # psmux's new-window cannot create at a free index directly
